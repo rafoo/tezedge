@@ -1,4 +1,5 @@
 // Copyright (c) SimpleStaking, Viable Systems, Trili Tech and Tezedge Contributors
+// SPDX-CopyrightText: 2023 Nomadic Labs <contact@nomadic-labs.com>
 // SPDX-License-Identifier: MIT
 
 //! Defines types of the intermediate data format.
@@ -9,7 +10,9 @@ use crate::enc::BinWriter;
 use crate::encoding::Encoding;
 use crate::encoding::HasEncoding;
 use crate::has_encoding;
-use crate::nom::NomReader;
+use crate::nom::{dynamic, NomError, NomReader, NomResult};
+
+use nom::combinator::{map, rest};
 
 use hex::FromHexError;
 use num_bigint::Sign;
@@ -17,6 +20,57 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "fuzzing")]
 use crate::fuzzing::bigint::BigIntMutator;
+
+#[derive(Debug, PartialEq)]
+/// Lazy, memoized deserialization of a dynamic block.
+pub struct LazyCell<'a, T> {
+    // Invariant: when the `deserialized` field is some, it's the
+    // result of deserialization of the `serialized` field using
+    // dynamic(T::nom_read)
+    serialized: &'a [u8],
+    deserialized: Option<T>,
+}
+
+impl<'a, T> LazyCell<'a, T>
+where
+    T: NomReader<'a>,
+{
+    pub fn to_bytes(self) -> &'a [u8] {
+        self.serialized
+    }
+
+    pub fn from_bytes(serialized: &'a [u8]) -> Self {
+        LazyCell {
+            serialized,
+            deserialized: None,
+        }
+    }
+
+    pub fn has_been_forced(&self) -> bool {
+        self.deserialized.is_some()
+    }
+
+    pub fn force<'b>(&'b mut self) -> Result<&'b T, nom::Err<NomError<'a>>> {
+        match self.deserialized.as_mut() {
+            None => {
+                let (_remaining, deserialized) = T::nom_read(self.serialized)?;
+                self.deserialized = Some(deserialized);
+                Ok(())
+            }
+            Some(_) => Ok(()),
+        }?;
+        Ok(self.deserialized.as_ref().unwrap())
+    }
+}
+
+impl<'a, T> NomReader<'a> for LazyCell<'a, T>
+where
+    T: NomReader<'a>,
+{
+    fn nom_read(input: &'a [u8]) -> NomResult<'a, Self> {
+        map(dynamic(rest), LazyCell::from_bytes)(input)
+    }
+}
 
 /// This is a wrapper for [num_bigint::BigInt] type.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -533,6 +587,8 @@ pub enum Value {
 mod tests {
 
     use super::*;
+    use crate::nom::{list, NomInput};
+    use nom::number::complete::u8;
 
     #[test]
     fn bytes_to_string() {
@@ -565,5 +621,38 @@ mod tests {
         let json = serde_json::json!("deadbeef");
         let bytes: Bytes = serde_json::from_value(json).unwrap();
         assert_eq!(bytes, Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    impl<'a> NomReader<'a> for u8 {
+        fn nom_read(input: &'a [u8]) -> NomResult<'a, Self> {
+            u8(input)
+        }
+    }
+
+    impl<'a, T> NomReader<'a> for Vec<T>
+    where
+        T: NomReader<'a>,
+    {
+        fn nom_read(input: &'a [u8]) -> NomResult<'a, Self> {
+            (list(T::nom_read))(input)
+        }
+    }
+
+    #[test]
+    fn test_lazy_dynamic() {
+        let input = &[0, 0, 0, 3, 0x78, 0x78, 0x78, 0xff];
+
+        let (remaining, mut res): (NomInput, LazyCell<Vec<u8>>) =
+            LazyCell::nom_read(input).unwrap();
+        assert_eq!(remaining, &[0xffu8][..]);
+        assert_eq!(
+            res,
+            (LazyCell {
+                serialized: &[0x78; 3],
+                deserialized: None
+            })
+        );
+        let deserialized: Vec<u8> = res.force().unwrap().to_owned();
+        assert_eq!(deserialized, vec![0x78; 3])
     }
 }
